@@ -670,14 +670,16 @@ fn extract_scalar_value_vector_float32(val: Vec<u8>) -> Result<ScalarValue> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, thread};
 
     use tidb_query_codegen::rpn_fn;
     use tidb_query_common::Result;
     use tidb_query_datatype::{
         FieldTypeTp,
+        codec::batch::LazyBatchColumnVec,
         expr::{EvalConfig, Flag},
     };
+    use tikv_util::sys::thread::StdThreadBuildWrapper;
     use tipb::ScalarFuncSig;
     use tipb_helper::ExprDefBuilder;
 
@@ -701,8 +703,68 @@ mod tests {
             .unwrap_or(0)
     }
 
-    fn max_short_circuit_depth() -> usize {
-        MAX_SHORT_CIRCUIT_NESTING_DEPTH
+    fn nested_logical_sig(root_sig: ScalarFuncSig, level: usize) -> ScalarFuncSig {
+        if level.is_multiple_of(2) {
+            root_sig
+        } else if root_sig == ScalarFuncSig::LogicalOr {
+            ScalarFuncSig::LogicalAnd
+        } else {
+            ScalarFuncSig::LogicalOr
+        }
+    }
+
+    fn nested_logical_expr(depth: usize, root_sig: ScalarFuncSig, wrap_in_cast: bool) -> Expr {
+        // Make even the innermost logical call worthwhile, so `depth` is the
+        // candidate short-circuit depth, without an off-by-one for a simple call.
+        let mut node =
+            ExprDefBuilder::scalar_func(ScalarFuncSig::CastIntAsInt, FieldTypeTp::LongLong)
+                .push_child(ExprDefBuilder::column_ref(depth, FieldTypeTp::LongLong))
+                .build();
+        for level in (0..depth).rev() {
+            if wrap_in_cast {
+                node =
+                    ExprDefBuilder::scalar_func(ScalarFuncSig::CastIntAsInt, FieldTypeTp::LongLong)
+                        .push_child(node)
+                        .build();
+            }
+            node = ExprDefBuilder::scalar_func(
+                nested_logical_sig(root_sig, level),
+                FieldTypeTp::LongLong,
+            )
+            .push_child(ExprDefBuilder::column_ref(level, FieldTypeTp::LongLong))
+            .push_child(node)
+            .build();
+        }
+        node
+    }
+
+    fn nested_logical_columns(
+        depth: usize,
+        root_sig: ScalarFuncSig,
+        partial: bool,
+    ) -> LazyBatchColumnVec {
+        let mut columns = Vec::with_capacity(depth + 1);
+        for level in 0..=depth {
+            let is_or = nested_logical_sig(root_sig, level) == ScalarFuncSig::LogicalOr;
+            let values: Vec<_> = (0..2 * crate::BATCH_MAX_SIZE)
+                .map(|physical_row| {
+                    let row = physical_row / 2;
+                    if level < depth && partial && row == level {
+                        // Resolve just one new row at each level, retaining nearly
+                        // full batches and row maps throughout the recursion.
+                        Some(if is_or { 9 } else { 0 })
+                    } else if row % 3 == 2 {
+                        None
+                    } else if level == depth {
+                        Some(if row % 3 == 0 { 0 } else { -7 })
+                    } else {
+                        Some(if is_or { 0 } else { -11 })
+                    }
+                })
+                .collect();
+            columns.push(VectorValue::Int(values.into()));
+        }
+        LazyBatchColumnVec::from(columns)
     }
 
     /// An RPN function for test. It accepts 1 int argument, returns float.
@@ -1143,35 +1205,99 @@ mod tests {
     }
 
     #[test]
-    fn test_deep_mixed_short_circuit_calls_fall_back_to_rpn() {
-        let mut node = ExprDefBuilder::column_ref(0, FieldTypeTp::LongLong).build();
-        for i in 0..=max_short_circuit_depth() + 1 {
-            let sig = if i % 2 == 0 {
-                ScalarFuncSig::LogicalOr
-            } else {
-                ScalarFuncSig::LogicalAnd
-            };
-            node = ExprDefBuilder::scalar_func(sig, FieldTypeTp::LongLong)
-                .push_child(ExprDefBuilder::column_ref(0, FieldTypeTp::LongLong))
-                .push_child(node)
-                .build();
+    fn test_short_circuit_depth_limit_stress_on_small_stack() {
+        let limit = MAX_SHORT_CIRCUIT_NESTING_DEPTH;
+        for depth in [limit - 1, limit, limit + 1, 8 * limit] {
+            for root_sig in [ScalarFuncSig::LogicalOr, ScalarFuncSig::LogicalAnd] {
+                for wrap_in_cast in [false, true] {
+                    // Build on a separate stack so the 2 MiB evaluation stack
+                    // below tests runtime recursion, not AST construction.
+                    let (lazy, eager) = thread::Builder::new()
+                        .stack_size(16 * 1024 * 1024)
+                        .spawn_wrapper(move || {
+                            let build = |ctx: &mut EvalContext| {
+                                RpnExpressionBuilder::build_from_expr_tree(
+                                    nested_logical_expr(depth, root_sig, wrap_in_cast),
+                                    ctx,
+                                    depth + 1,
+                                )
+                                .unwrap()
+                            };
+                            (
+                                build(&mut short_circuit_context()),
+                                build(&mut EvalContext::default()),
+                            )
+                        })
+                        .unwrap()
+                        .join()
+                        .unwrap();
+
+                    thread::Builder::new()
+                        .stack_size(2 * 1024 * 1024)
+                        .spawn_wrapper(move || {
+                            let case =
+                                format!("depth={depth}, root={root_sig:?}, cast={wrap_in_cast}");
+                            assert_eq!(short_circuit_depth(&lazy), depth.min(limit));
+                            assert_eq!(short_circuit_depth(&eager), 0);
+                            // Collect metadata on the constrained stack too.
+                            assert_eq!(lazy.node_count(), eager.node_count());
+                            assert_eq!(lazy.column_ref_count(), depth + 1);
+                            assert_eq!(
+                                lazy.referenced_column_offsets(),
+                                &(0..=depth).collect::<Vec<_>>()
+                            );
+
+                            let batch_size = crate::BATCH_MAX_SIZE;
+                            let schema = vec![FieldTypeTp::LongLong.into(); depth + 1];
+                            // Sparse, reversed rows force nested calls to maintain
+                            // both output positions and physical row mappings.
+                            let mut logical_rows: Vec<_> =
+                                (0..batch_size).rev().map(|row| 2 * row + 1).collect();
+                            for partial in [false, true] {
+                                let mut columns = nested_logical_columns(depth, root_sig, partial);
+                                let mut lazy_ctx = short_circuit_context();
+                                let mut eager_ctx = EvalContext::default();
+                                for batch in 0..8 {
+                                    let expected = eager
+                                        .eval(
+                                            &mut eager_ctx,
+                                            &schema,
+                                            &mut columns,
+                                            &logical_rows,
+                                            batch_size,
+                                        )
+                                        .unwrap()
+                                        .vector_value()
+                                        .unwrap()
+                                        .as_ref()
+                                        .to_int_vec();
+                                    assert!(expected.contains(&Some(0)));
+                                    assert!(expected.contains(&Some(1)));
+                                    assert!(expected.contains(&None));
+                                    let result = lazy
+                                        .eval(
+                                            &mut lazy_ctx,
+                                            &schema,
+                                            &mut columns,
+                                            &logical_rows,
+                                            batch_size,
+                                        )
+                                        .unwrap();
+                                    assert_eq!(
+                                        result.vector_value().unwrap().as_ref().to_int_vec(),
+                                        expected,
+                                        "{case}, partial={partial}, batch={batch}"
+                                    );
+                                    logical_rows.rotate_left(1);
+                                }
+                            }
+                        })
+                        .unwrap()
+                        .join()
+                        .unwrap();
+                }
+            }
         }
-
-        let mut ctx = short_circuit_context();
-        let exp = RpnExpressionBuilder::build_from_expr_tree_with_fn_mapper_and_ctx(
-            node,
-            &mut ctx,
-            crate::map_expr_node_to_rpn_func,
-            1,
-        )
-        .unwrap();
-
-        assert_eq!(short_circuit_depth(&exp), max_short_circuit_depth());
-        assert!(matches!(
-            exp.last(),
-            Some(RpnExpressionNode::FnCall { func_meta, .. })
-                if func_meta.name == "logical_or" || func_meta.name == "logical_and"
-        ));
     }
 
     #[test]
